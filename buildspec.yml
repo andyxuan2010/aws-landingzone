@@ -1,0 +1,40 @@
+version: 0.2
+
+env:
+  variables:
+    DEPLOY_ENV: dev
+    TF_VERSION: 1.15.8
+    GH_TF_TEMPLATE_REPO: andyxuan2010/aws-template
+    ENABLE_CODEPIPELINE_APPLY: "false"
+
+phases:
+  install:
+    commands:
+      - curl -fsSLo terraform.zip "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip"
+      - unzip -q terraform.zip -d /usr/local/bin
+  pre_build:
+    commands:
+      - |
+        if [ -n "${TF_EXECUTION_ROLE_ARN:-}" ]; then
+          read AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN <<EOF
+        $(aws sts assume-role --role-arn "${TF_EXECUTION_ROLE_ARN}" --role-session-name codepipeline-terraform --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text)
+        EOF
+          export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+        fi
+      - git clone --depth 1 "https://github.com/${GH_TF_TEMPLATE_REPO}.git" ../aws-template
+      - terraform fmt -check -recursive
+      - terraform init -reconfigure -backend-config="environments/${DEPLOY_ENV}/backend.hcl"
+      - terraform validate
+  build:
+    commands:
+      - terraform plan -var-file="environments/${DEPLOY_ENV}/terraform.tfvars" -out=tfplan
+      - |
+        if [ "${ENABLE_CODEPIPELINE_APPLY}" = "true" ]; then
+          terraform apply -auto-approve tfplan
+        else
+          echo "Apply is gated; set ENABLE_CODEPIPELINE_APPLY=true on the CodeBuild project only after approval."
+        fi
+
+artifacts:
+  files:
+    - tfplan

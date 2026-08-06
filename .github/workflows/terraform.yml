@@ -1,0 +1,134 @@
+name: Terraform
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      deploy_environment:
+        description: Environment to plan or apply
+        required: true
+        default: dev
+        type: choice
+        options: [dev, sandbox, prod]
+      apply:
+        description: Apply the saved plan (requires environment approval and AWS OIDC)
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TF_IN_AUTOMATION: true
+  TF_INPUT: false
+  TF_VERSION: 1.15.8
+  # Public mirror used until cross-repository access to CCOE-Azure/aws-template is configured.
+  GH_TF_TEMPLATE_REPO: andyxuan2010/aws-template
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check out reusable AWS modules
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ vars.GH_TF_TEMPLATE_REPO || env.GH_TF_TEMPLATE_REPO }}
+          path: aws-template
+      - name: Place modules at expected sibling path
+        run: mv aws-template ../aws-template
+      - uses: hashicorp/setup-terraform@v4
+        with: { terraform_version: "${{ env.TF_VERSION }}" }
+      - name: Format
+        run: terraform fmt -check -recursive
+      - name: Initialize without backend
+        run: terraform init -backend=false
+      - name: Validate
+        run: terraform validate
+
+  plan:
+    if: github.event_name == 'workflow_dispatch' && vars.ENABLE_AWS_PLAN == 'true'
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.deploy_environment }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ vars.GH_TF_TEMPLATE_REPO || env.GH_TF_TEMPLATE_REPO }}
+          path: aws-template
+      - run: mv aws-template ../aws-template
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+      - uses: hashicorp/setup-terraform@v4
+        with: { terraform_version: "${{ env.TF_VERSION }}" }
+      - run: terraform init -reconfigure -backend-config="environments/${{ inputs.deploy_environment }}/backend.hcl"
+      - run: terraform plan -var-file="environments/${{ inputs.deploy_environment }}/terraform.tfvars" -out=tfplan
+      - uses: actions/upload-artifact@v4
+        with: { name: "tfplan-${{ inputs.deploy_environment }}", path: tfplan }
+
+  apply:
+    if: github.event_name == 'workflow_dispatch' && inputs.apply == true && vars.ENABLE_AWS_APPLY == 'true'
+    needs: plan
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.deploy_environment }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ vars.GH_TF_TEMPLATE_REPO || env.GH_TF_TEMPLATE_REPO }}
+          path: aws-template
+      - run: mv aws-template ../aws-template
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+      - uses: hashicorp/setup-terraform@v4
+        with: { terraform_version: "${{ env.TF_VERSION }}" }
+      - run: terraform init -reconfigure -backend-config="environments/${{ inputs.deploy_environment }}/backend.hcl"
+      - uses: actions/download-artifact@v4
+        with: { name: "tfplan-${{ inputs.deploy_environment }}" }
+      - run: terraform apply -auto-approve tfplan
+
+  publish-stage:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository != 'andyxuan2010/aws-landingzone'
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions: { contents: read }
+    steps:
+      - uses: actions/checkout@v6
+      - name: Publish clean snapshot to staging repository
+        env:
+          STAGE_REPOSITORY: andyxuan2010/aws-landingzone
+          STAGE_REPO_TOKEN: ${{ secrets.STAGE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "${STAGE_REPO_TOKEN}" || { echo "STAGE_REPO_TOKEN is not configured; skipping staging publication."; exit 0; }
+          workdir="$(mktemp -d)"
+          trap 'rm -rf "${workdir}"' EXIT
+          rsync -a --exclude=.git "${GITHUB_WORKSPACE}/" "${workdir}/repo/"
+          cd "${workdir}/repo"
+          git init
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b main
+          git add .
+          git commit -m "Stage snapshot from ${GITHUB_REPOSITORY}@${GITHUB_SHA}"
+          git remote add origin "https://x-access-token:${STAGE_REPO_TOKEN}@github.com/${STAGE_REPOSITORY}.git"
+          git push --force origin main
