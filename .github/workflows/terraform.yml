@@ -1,0 +1,255 @@
+name: Terraform
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      deploy_environment:
+        description: Environment to plan or apply
+        required: true
+        default: dev
+        type: choice
+        options: [dev, sandbox, prod]
+      apply:
+        description: Apply the saved plan (requires environment approval and AWS OIDC)
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TF_IN_AUTOMATION: true
+  TF_INPUT: false
+  TF_VERSION: 1.15.8
+  # Public mirror used until cross-repository access to CCOE-Azure/aws-template is configured.
+  GH_TF_TEMPLATE_REPO: andyxuan2010/aws-template
+
+jobs:
+  terraform-gate:
+    name: Terraform Workflow Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      enabled: ${{ steps.gate.outputs.enabled }}
+    steps:
+      - name: Evaluate IS_ORIGIN
+        id: gate
+        shell: bash
+        env:
+          IS_ORIGIN: ${{ vars.IS_ORIGIN }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${IS_ORIGIN,,}" == "true" ]]; then
+            echo "enabled=true" >> "${GITHUB_OUTPUT}"
+            echo "Terraform workflow is enabled for the origin repository."
+          else
+            echo "enabled=false" >> "${GITHUB_OUTPUT}"
+            echo "Terraform workflow is disabled; downstream Terraform jobs will be skipped."
+          fi
+  validate:
+    needs: terraform-gate
+    if: needs['terraform-gate'].outputs.enabled == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check out reusable AWS modules
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ vars.GH_TF_TEMPLATE_REPO || env.GH_TF_TEMPLATE_REPO }}
+          path: aws-template
+      - name: Place modules at expected sibling path
+        run: mv aws-template ../aws-template
+      - uses: hashicorp/setup-terraform@v4
+        with: { terraform_version: "${{ env.TF_VERSION }}" }
+      - name: Format
+        run: terraform fmt -check -recursive
+      - name: Initialize without backend
+        run: terraform init -backend=false
+      - name: Validate
+        run: terraform validate
+
+  create-git-tag:
+    name: Create Git Tag
+    if: always() && needs['terraform-gate'].outputs.enabled == 'true' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && needs.validate.result == 'success' && (needs.plan.result == 'success' || needs.plan.result == 'skipped')
+    needs:
+      - terraform-gate
+      - validate
+      - plan
+    outputs:
+      release_tag: ${{ steps.semver.outputs.release_tag }}
+      release_notes: ${{ steps.semver.outputs.release_notes }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Create canonical GitHub release tag
+        id: semver
+        env:
+          SOURCE_BRANCH: ${{ github.ref_name }}
+          SOURCE_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --force --tags origin
+
+          latest_tag="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n 1)"
+          if [[ -z "${latest_tag}" ]]; then
+            latest_tag="v1.0.0"
+          fi
+
+          version="${latest_tag#v}"
+          IFS='.' read -r major minor patch <<< "${version}"
+          release_tag="v${major}.${minor}.$((patch + 1))"
+          release_notes="$(git log -n 20 --format='- %s (%h)' "${latest_tag}..${SOURCE_SHA}" || true)"
+          if [[ -z "${release_notes}" ]]; then
+            release_notes="- ${SOURCE_SHA}"
+          fi
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${release_tag}" >/dev/null 2>&1; then
+            echo "Tag ${release_tag} already exists on origin."
+          else
+            git tag -a "${release_tag}" "${SOURCE_SHA}" -m "Release ${release_tag} from ${SOURCE_BRANCH}@${SOURCE_SHA}"
+            git push origin "refs/tags/${release_tag}"
+          fi
+
+          {
+            echo "release_tag=${release_tag}"
+            echo "release_notes<<EOF"
+            echo "${release_notes}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+  plan:
+    if: needs['terraform-gate'].outputs.enabled == 'true' && (github.event_name == 'workflow_dispatch' && vars.ENABLE_AWS_PLAN == 'true')
+    needs:
+      - terraform-gate
+      - validate
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.deploy_environment }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ vars.GH_TF_TEMPLATE_REPO || env.GH_TF_TEMPLATE_REPO }}
+          path: aws-template
+      - run: mv aws-template ../aws-template
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+      - uses: hashicorp/setup-terraform@v4
+        with: { terraform_version: "${{ env.TF_VERSION }}" }
+      - run: terraform init -reconfigure -backend-config="environments/${{ inputs.deploy_environment }}/backend.hcl"
+      - run: terraform plan -var-file="environments/${{ inputs.deploy_environment }}/terraform.tfvars" -out=tfplan
+      - uses: actions/upload-artifact@v4
+        with: { name: "tfplan-${{ inputs.deploy_environment }}", path: tfplan }
+
+  apply:
+    if: needs['terraform-gate'].outputs.enabled == 'true' && (github.event_name == 'workflow_dispatch' && inputs.apply == true && vars.ENABLE_AWS_APPLY == 'true')
+    needs:
+      - terraform-gate
+      - plan
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.deploy_environment }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ vars.GH_TF_TEMPLATE_REPO || env.GH_TF_TEMPLATE_REPO }}
+          path: aws-template
+      - run: mv aws-template ../aws-template
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+      - uses: hashicorp/setup-terraform@v4
+        with: { terraform_version: "${{ env.TF_VERSION }}" }
+      - run: terraform init -reconfigure -backend-config="environments/${{ inputs.deploy_environment }}/backend.hcl"
+      - uses: actions/download-artifact@v4
+        with: { name: "tfplan-${{ inputs.deploy_environment }}" }
+      - run: terraform apply -auto-approve tfplan
+
+  publish-stage:
+    if: always() && needs['terraform-gate'].outputs.enabled == 'true' && (github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository != 'andyxuan2010/aws-landingzone' && (needs.plan.result == 'success' || needs.plan.result == 'skipped') && (needs.create-git-tag.result == 'success' || needs.create-git-tag.result == 'skipped'))
+    needs:
+      - terraform-gate
+      - validate
+      - plan
+      - create-git-tag
+    runs-on: ubuntu-latest
+    permissions: { contents: read }
+    steps:
+      - uses: actions/checkout@v6
+      - name: Publish clean snapshot to staging repository
+        env:
+          STAGE_REPOSITORY: ${{ vars.STAGE_REPOSITORY }}
+          STAGE_REPO_TOKEN: ${{ secrets.STAGE_REPO_TOKEN }}
+          RELEASE_TAG: ${{ needs.create-git-tag.outputs.release_tag }}
+          RELEASE_NOTES: ${{ needs.create-git-tag.outputs.release_notes }}
+        run: |
+          set -euo pipefail
+          test -n "${STAGE_REPOSITORY}" || { echo "STAGE_REPOSITORY is not configured; skipping staging publication."; exit 0; }
+          test -n "${STAGE_REPO_TOKEN}" || { echo "STAGE_REPO_TOKEN is not configured; skipping staging publication."; exit 0; }
+          workdir="$(mktemp -d)"
+          trap 'rm -rf "${workdir}"' EXIT
+          rsync -a --exclude=.git "${GITHUB_WORKSPACE}/" "${workdir}/repo/"
+          cd "${workdir}/repo"
+          git init
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b main
+          git add .
+          git commit -m "Stage snapshot from ${GITHUB_REPOSITORY}@${GITHUB_SHA}"
+
+          if [[ -n "${RELEASE_TAG}" ]]; then
+            release_notes="${RELEASE_NOTES:-}"
+            if [[ -z "${release_notes}" ]]; then
+              release_notes="- ${GITHUB_SHA}"
+            fi
+
+            tag_message="$(mktemp)"
+            {
+              echo "Release ${RELEASE_TAG} snapshot"
+              echo
+              echo "Source: ${GITHUB_REPOSITORY}@${GITHUB_SHA}"
+              echo
+              echo "Changes:"
+              printf '%s\n' "${release_notes}"
+            } > "${tag_message}"
+
+            git tag -a "${RELEASE_TAG}" -F "${tag_message}"
+          fi
+
+          git remote add origin "https://x-access-token:${STAGE_REPO_TOKEN}@github.com/${STAGE_REPOSITORY}.git"
+          git push --force origin main
+          if [[ -n "${RELEASE_TAG}" ]]; then
+            if git ls-remote --exit-code --tags origin "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+              echo "Stage repo already has tag ${RELEASE_TAG}; leaving it unchanged."
+            else
+              git push origin "refs/tags/${RELEASE_TAG}"
+            fi
+          fi
