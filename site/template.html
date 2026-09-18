@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="{{DESCRIPTION}}">
+  <title>{{PAGE_TITLE}} · {{SITE_TITLE}}</title>
+  <link rel="stylesheet" href="{{ROOT_PREFIX}}styles.css">
+</head>
+<body data-index-path="{{ROOT_PREFIX}}index.html">
+  <div class="site-shell">
+    <aside class="sidebar">
+      <a class="brand" href="{{ROOT_PREFIX}}index.html">
+        <span class="brand-mark">AWS</span>
+        <span>
+          <strong>{{SITE_TITLE}}</strong>
+          <small>{{EYEBROW}}</small>
+        </span>
+      </a>
+
+      <form class="search" data-search-form role="search">
+        <label class="sr-only" for="site-search">Search documentation</label>
+        <input id="site-search" name="q" type="search" placeholder="Search documentation" autocomplete="off">
+      </form>
+
+      <nav class="sidebar-nav" aria-label="Documentation">
+        <a class="nav-home {{HOME_ACTIVE}}" href="{{ROOT_PREFIX}}index.html">Overview</a>
+        <p class="nav-label">Documentation</p>
+        {{NAVIGATION}}
+      </nav>
+
+      <div class="sidebar-footer">
+        Generated from Markdown · {{GENERATED_AT}}
+      </div>
+    </aside>
+
+    <main class="content">
+      {{CONTENT}}
+    </main>
+  </div>
+  <script src="{{ROOT_PREFIX}}site.js" defer></script>
+</body>
+</html>

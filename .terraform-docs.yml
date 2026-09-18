@@ -1,0 +1,14 @@
+formatter: markdown table
+output:
+  file: docs/TERRAFORM_REFERENCE.md
+  mode: replace
+settings:
+  anchor: true
+  color: false
+  default: true
+  description: true
+  escape: true
+  hide-empty: false
+  required: true
+  sensitive: true
+  type: true
