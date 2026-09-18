@@ -1,0 +1,6 @@
+{
+  "title": "AWS Landing Zone",
+  "description": "Terraform composition for a small, secure AWS landing-zone baseline.",
+  "eyebrow": "Cloud foundations · Infrastructure as code",
+  "repository": "https://github.com/CCOE-Azure/aws-landingzone"
+}

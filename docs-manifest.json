@@ -1,0 +1,10 @@
+{
+  "generatedAt": "2026-09-17T23:50:50Z",
+  "documents": [
+    "docs/ARCHITECTURE.md",
+    "docs/DEPLOYMENT.md",
+    "docs/TERRAFORM_REFERENCE.md",
+    "docs/VALIDATION.md",
+    "README.md"
+  ]
+}
